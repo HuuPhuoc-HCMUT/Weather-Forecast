@@ -1,183 +1,108 @@
 import json
 import logging
-import time
 import requests
 import joblib
 import numpy as np
 import pandas as pd
+import os
 
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from pydantic import BaseModel, field_validator
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
-# Import hàm xử lý logic nghiệp vụ của bạn
-from decision_engine import apply_rules
+# --- 1. Setup ---
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logger = logging.getLogger("irrigation_pro")
 
-# --- Cấu hình Logging ---
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-)
-logger = logging.getLogger("weather_api")
-
-# --- Đường dẫn và Load Metadata ---
 ARTIFACT_DIR = Path(__file__).resolve().parent
 MODEL_DIR = ARTIFACT_DIR / "models"
+DB_FILE = ARTIFACT_DIR / "irrigation_db.json"
+
+if not DB_FILE.exists():
+    with open(DB_FILE, "w") as f: json.dump({}, f)
 
 with open(ARTIFACT_DIR / "metadata.json", "r", encoding="utf-8") as f:
     metadata = json.load(f)
-
-HORIZON = metadata["horizon"]
 FEATURES = metadata["features"]
+models_temp, models_rhum, models_prcp = {}, {}, {}
 
-# --- Load Models ---
-models_temp = {}
-models_rhum = {}
-models_prcp = {}
-
-logger.info("Loading model artifacts from %s", MODEL_DIR)
-for h in range(1, HORIZON + 1):
+for h in range(1, metadata["horizon"] + 1):
     models_temp[h] = joblib.load(MODEL_DIR / f"model_temp_h{h}.joblib")
     models_rhum[h] = joblib.load(MODEL_DIR / f"model_rhum_h{h}.joblib")
     models_prcp[h] = joblib.load(MODEL_DIR / f"model_prcp_h{h}.joblib")
-logger.info("Loaded model artifacts successfully for horizon=1..%s", HORIZON)
 
-app = FastAPI(title="Weather Forecast API (Open-Meteo Powered)", version="1.1.0")
+app = FastAPI(title="Pro Irrigation AI v3.5")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# --- Middleware ---
-@app.middleware("http")
-async def request_timer_middleware(request: Request, call_next):
-    started_at = time.perf_counter()
-    logger.info("Incoming request: %s %s", request.method, request.url.path)
-    try:
-        response = await call_next(request)
-    except Exception:
-        elapsed = time.perf_counter() - started_at
-        logger.exception("Request failed | elapsed=%.3fs", elapsed)
-        raise
-    elapsed = time.perf_counter() - started_at
-    logger.info("Completed request | status=%s | elapsed=%.3fs", response.status_code, elapsed)
-    return response
+# --- 2. Request Models ---
+class AutoIrrigationRequest(BaseModel):
+    zone: str
+    lat: float; lon: float
+    min_moisture: float; max_moisture: float
+    temps: List[float]; hums: List[float]; moists: List[float]
 
-# --- Models Pydantic ---
 class SmartForecastRequest(BaseModel):
-    lat: float
-    lon: float
-    temps: List[float]
-    rhums: List[float]
+    lat: float; lon: float; temps: List[float]; rhums: List[float]
 
-    @field_validator("temps", "rhums")
-    @classmethod
-    def validate_non_empty(cls, v: List[float]) -> List[float]:
-        if not v:
-            raise ValueError("List must not be empty")
-        return v
+# --- 3. Database Helpers ---
+def clear_zone(zone: str):
+    with open(DB_FILE, "r") as f: db = json.load(f)
+    if zone in db:
+        del db[zone]
+        with open(DB_FILE, "w") as f: json.dump(db, f, indent=2)
 
-# --- Core Functions ---
-
-def fetch_recent_weather_history(lat: float, lon: float, lookback_hours: int = 36) -> pd.DataFrame:
-    """
-    Lấy dữ liệu thời tiết thực tế gần đây từ Open-Meteo API.
-    Nguồn này 'mở' hoàn toàn, không cần API Key và rất tin cậy.
-    """
-    logger.info("Fetching history from Open-Meteo | lat=%s lon=%s", lat, lon)
-    started_at = time.perf_counter()
-
-    # API URL của Open-Meteo
-    url = "https://api.open-meteo.com/v1/forecast"
-    
-    # Request tham số: past_days=2 để đảm bảo đủ dữ liệu cho lags (24h) và rolling windows
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "hourly": "temperature_2m,relative_humidity_2m,precipitation,surface_pressure,wind_speed_10m",
-        "past_days": 2, 
-        "forecast_days": 1,
-        "timezone": "UTC"
+def save_schedule(zone: str, scheduled_at: datetime, amount: float, danger_h: int):
+    with open(DB_FILE, "r") as f: db = json.load(f)
+    db[zone] = {
+        "status": "WATER",
+        "scheduled_at": scheduled_at.isoformat(),
+        "expires_at": (scheduled_at + timedelta(minutes=45)).isoformat(),
+        "amount_pct": round(amount, 2),
+        "danger_hour": danger_h,
+        "created_at": datetime.now().isoformat()
     }
+    with open(DB_FILE, "w") as f: json.dump(db, f, indent=2)
 
+# --- 4. Core Logic Functions ---
+
+def calc_k_evap(temps_hist, hums_hist, moists_hist):
+    diffs, drivers = [], []
+    for i in range(1, len(moists_hist)):
+        d_m = moists_hist[i-1] - moists_hist[i]
+        if d_m > 0:
+            diffs.append(d_m)
+            drivers.append(temps_hist[i] / (hums_hist[i] + 1))
+    return sum(diffs) / sum(drivers) if drivers and sum(drivers) > 0 else 0.015
+
+def fetch_recent_weather_history(lat, lon, lookback_hours=36):
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = {"latitude": lat, "longitude": lon, "hourly": "temperature_2m,relative_humidity_2m,precipitation,surface_pressure,wind_speed_10m", "past_days": 2, "forecast_days": 1, "timezone": "UTC"}
     try:
-        response = requests.get(url, params=params, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        
-        hourly = data["hourly"]
-        df = pd.DataFrame({
-            "temp": hourly["temperature_2m"],
-            "rhum": hourly["relative_humidity_2m"],
-            "prcp": hourly["precipitation"],
-            "pres": hourly["surface_pressure"],
-            "wspd": hourly["wind_speed_10m"]
-        }, index=pd.to_datetime(hourly["time"]))
-        
-        df = df.astype(float)
-        
-    except Exception as ex:
-        logger.exception("Open-Meteo fetch failed")
-        raise HTTPException(
-            status_code=502,
-            detail=f"Failed to fetch weather from Open-Meteo: {str(ex)}"
-        )
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status() # Kiểm tra lỗi HTTP
+        data = resp.json()["hourly"]
+        df = pd.DataFrame({"temp": data["temperature_2m"], "rhum": data["relative_humidity_2m"], "prcp": data["precipitation"], "pres": data["surface_pressure"], "wspd": data["wind_speed_10m"]}, index=pd.to_datetime(data["time"])).astype(float)
+        return df.sort_index().interpolate().ffill().bfill().tail(lookback_hours + 12)
+    except Exception as e:
+        logger.error(f"Weather API Error: {e}")
+        raise HTTPException(status_code=502, detail="Weather provider unavailable")
 
-    elapsed = time.perf_counter() - started_at
-    logger.info("Provider returned %s rows in %.3fs", len(df), elapsed)
-
-    # Làm sạch dữ liệu
-    df = df.sort_index()
-    df = df.interpolate(limit_direction="both").ffill().bfill()
+def build_feature_row(df):
+    df = df.copy()
+    df["hour"], df["day_of_week"], df["month"], df["day_of_year"] = df.index.hour, df.index.dayofweek, df.index.month, df.index.dayofyear
+    df["hour_sin"], df["hour_cos"] = np.sin(2 * np.pi * df["hour"] / 24), np.cos(2 * np.pi * df["hour"] / 24)
+    df["doy_sin"], df["doy_cos"] = np.sin(2 * np.pi * df["day_of_year"] / 366), np.cos(2 * np.pi * df["day_of_year"] / 366)
     
-    # Cắt lấy số lượng hàng cần thiết cho Feature Engineering (lookback + buffer)
-    df = df.tail(lookback_hours + 12).copy()
-
-    if len(df) < 30:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Not enough history rows from provider. Got {len(df)}."
-        )
-
-    return df
-
-def override_recent_temp_rhum(history: pd.DataFrame, temps: List[float], rhums: List[float]) -> pd.DataFrame:
-    if len(temps) != len(rhums):
-        raise HTTPException(status_code=400, detail="temps and rhums must have the same length")
-
-    n = len(temps)
-    if len(history) < n:
-        raise HTTPException(status_code=400, detail="History too short to override")
-
-    out = history.copy()
-    # Ghi đè dữ liệu cảm biến thực tế của người dùng vào các dòng cuối cùng
-    out.iloc[-n:, out.columns.get_loc("temp")] = temps
-    out.iloc[-n:, out.columns.get_loc("rhum")] = rhums
-    return out
-
-def build_feature_row_from_history(history_df: pd.DataFrame) -> pd.DataFrame:
-    df = history_df.copy()
-    
-    # Time features
-    df["hour"] = df.index.hour
-    df["day_of_week"] = df.index.dayofweek
-    df["day_of_year"] = df.index.dayofyear
-    df["month"] = df.index.month
-
-    # Cyclic encoding
-    df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24)
-    df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24)
-    df["doy_sin"] = np.sin(2 * np.pi * df["day_of_year"] / 366)
-    df["doy_cos"] = np.cos(2 * np.pi * df["day_of_year"] / 366)
-
     use_cols = ["temp", "rhum", "prcp", "wspd", "pres"]
-    lags = [1, 2, 3, 6, 12, 24]
-    windows = [3, 6, 12, 24]
-
-    for lag in lags:
-        for col in use_cols:
-            df[f"{col}_lag_{lag}"] = df[col].shift(lag)
-
-    for w in windows:
+    for lag in [1, 2, 3, 6, 12, 24]:
+        for col in use_cols: df[f"{col}_lag_{lag}"] = df[col].shift(lag)
+    
+    # --- BỔ SUNG ĐẦY ĐỦ ROLLING WINDOWS ĐỂ TRÁNH KEYERROR ---
+    for w in [3, 6, 12, 24]:
         df[f"temp_roll_mean_{w}"] = df["temp"].shift(1).rolling(w).mean()
         df[f"temp_roll_std_{w}"] = df["temp"].shift(1).rolling(w).std()
         df[f"rhum_roll_mean_{w}"] = df["rhum"].shift(1).rolling(w).mean()
@@ -186,70 +111,75 @@ def build_feature_row_from_history(history_df: pd.DataFrame) -> pd.DataFrame:
         df[f"wspd_roll_mean_{w}"] = df["wspd"].shift(1).rolling(w).mean()
         df[f"pres_roll_mean_{w}"] = df["pres"].shift(1).rolling(w).mean()
 
-    df = df.dropna().copy()
-    if df.empty:
-        raise HTTPException(status_code=400, detail="Feature engineering failed (not enough data)")
+    return df.dropna().iloc[[-1]][FEATURES]
 
-    latest = df.iloc[[-1]].copy()
-    
-    # Kiểm tra xem có thiếu feature nào model yêu cầu không
-    missing_features = [f for f in FEATURES if f not in latest.columns]
-    if missing_features:
-        raise HTTPException(status_code=500, detail={"error": "Missing features", "list": missing_features[:5]})
+def internal_weather_engine(lat, lon, temps, rhums, hours):
+    history = fetch_recent_weather_history(lat, lon)
+    n = len(temps)
+    history.iloc[-n:, history.columns.get_loc("temp")] = temps
+    history.iloc[-n:, history.columns.get_loc("rhum")] = rhums
+    row = build_feature_row(history)
+    return [{"horizon": h, "temp": round(float(models_temp[h].predict(row)[0]), 2), "rhum": round(float(models_rhum[h].predict(row)[0]), 2), "prcp": round(max(0.0, float(models_prcp[h].predict(row)[0])), 2)} for h in range(1, hours + 1)]
 
-    return latest[FEATURES]
-
-def generate_forecast_from_feature_row(row: pd.DataFrame, hours: int) -> List[Dict[str, Any]]:
-    results = []
-    for h in range(1, hours + 1):
-        p_temp = float(models_temp[h].predict(row)[0])
-        p_rhum = float(models_rhum[h].predict(row)[0])
-        p_prcp = max(0.0, float(models_prcp[h].predict(row)[0]))
-
-        results.append({
-            "horizon": h,
-            "pred_temp": round(p_temp, 2),
-            "pred_rhum": round(p_rhum, 2),
-            "pred_prcp": round(p_prcp, 2)
-        })
-    return results
-
-# --- Endpoints ---
+# --- 5. Endpoints ---
 
 @app.get("/")
 def root():
-    return {
-        "status": "online",
-        "provider": "Open-Meteo",
-        "max_horizon": HORIZON
-    }
+    return {"status": "online", "message": "Pro Irrigation AI v3.5 is running"}
 
 @app.post("/smart-predict")
 def smart_predict(req: SmartForecastRequest, hours: int = Query(default=6, ge=1)):
-    if hours > HORIZON:
-        raise HTTPException(status_code=400, detail=f"Max hours is {HORIZON}")
+    forecast = internal_weather_engine(req.lat, req.lon, req.temps, req.rhums, hours)
+    return {"forecast": forecast}
 
-    # 1. Lấy dữ liệu lịch sử từ API mở
-    history = fetch_recent_weather_history(req.lat, req.lon, lookback_hours=36)
+@app.post("/auto-irrigation")
+def auto_irrigation(req: AutoIrrigationRequest):
+    now = datetime.now()
+    target_moisture = (req.min_moisture + req.max_moisture) / 2
     
-    # 2. Ghi đè bằng dữ liệu thực tế từ sensor gửi lên
-    history = override_recent_temp_rhum(history, req.temps, req.rhums)
+    # BƯỚC 0: KIỂM TRA PENDING
+    with open(DB_FILE, "r") as f: db = json.load(f)
+    if req.zone in db:
+        pending = db[req.zone]
+        sched_time = datetime.fromisoformat(pending["scheduled_at"])
+        expire_time = datetime.fromisoformat(pending["expires_at"])
+        
+        is_expired = now > expire_time
+        is_reached_target = req.moists[-1] >= target_moisture - 2
+        
+        if not is_expired and not is_reached_target:
+            rem_min = int((sched_time - now).total_seconds() / 60)
+            return {"status": "WATER", "start_in_minutes": max(0, rem_min), "amount_pct": pending["amount_pct"], "danger_hour": pending["danger_hour"], "source": "verified_pending"}
+        else:
+            clear_zone(req.zone)
 
-    # 3. Tạo vector đặc trưng (Feature Engineering)
-    row = build_feature_row_from_history(history)
+    # BƯỚC 1: DỰ BÁO VÀ LẬP LỊCH
+    forecast = internal_weather_engine(req.lat, req.lon, req.temps, req.hums, 6)
+    k_evap = calc_k_evap(req.temps, req.hums, req.moists)
     
-    # 4. Chạy model dự báo cho n giờ tới
-    forecast = generate_forecast_from_feature_row(row, hours)
+    # Tìm danger_hour
+    sim_m, hour_of_trouble = req.moists[-1], -1
+    for fc in forecast:
+        sim_m = sim_m - (k_evap * (fc["temp"] / (fc["rhum"] + 1))) + (fc["prcp"] * 5.0)
+        if sim_m < req.min_moisture + 5:
+            hour_of_trouble = fc["horizon"]; break
     
-    # 5. Áp dụng rule-based engine để ra quyết định
-    decision = apply_rules(forecast)
-
-    return {
-        "lat": req.lat,
-        "lon": req.lon,
-        "forecast": forecast,
-        "decision_result": decision
-    }
+    if hour_of_trouble != -1:
+        lead_h = max(1, hour_of_trouble - 2)
+        sched_at = now + timedelta(hours=lead_h)
+        
+        # Ước tính amount
+        m_at_sched = req.moists[-1]
+        for i in range(lead_h):
+            fc = forecast[i]
+            m_at_sched = m_at_sched - (k_evap * (fc["temp"] / (fc["rhum"] + 1))) + (fc["prcp"] * 5.0)
+        
+        amount = max(0, target_moisture - m_at_sched)
+        save_schedule(req.zone, sched_at, amount, hour_of_trouble)
+        
+        return {"status": "WATER", "start_in_minutes": lead_h * 60, "amount_pct": round(amount, 2), "danger_hour": hour_of_trouble, "scheduled_at_abs": sched_at.isoformat()}
+    
+    return {"status": "IDLE", "start_in_minutes": 0, "amount_pct": 0, "danger_hour": -1}
 
 if __name__ == "__main__":
     import uvicorn
