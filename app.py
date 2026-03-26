@@ -148,8 +148,9 @@ def auto_irrigation(req: AutoIrrigationRequest):
         is_reached_target = req.moists[-1] >= target_moisture - 2
         
         if not is_expired and not is_reached_target:
-            rem_min = int((sched_time - now).total_seconds() / 60)
-            return {"status": "WATER", "start_in_minutes": max(0, rem_min), "amount_pct": pending["amount_pct"], "danger_hour": pending["danger_hour"], "source": "verified_pending"}
+            # rem_min = int((sched_time - now).total_seconds() / 60)
+            # return {"status": "WATER", "start_in_minutes": max(0, rem_min), "amount_pct": pending["amount_pct"], "danger_hour": pending["danger_hour"], "source": "verified_pending"}
+            return {"amount_pct": pending["amount_pct"], "scheduled_at_abs": pending["scheduled_at"]}
         else:
             clear_zone(req.zone)
 
