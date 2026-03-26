@@ -177,9 +177,11 @@ def auto_irrigation(req: AutoIrrigationRequest):
         amount = max(0, target_moisture - m_at_sched)
         save_schedule(req.zone, sched_at, amount, hour_of_trouble)
         
-        return {"status": "WATER", "start_in_minutes": lead_h * 60, "amount_pct": round(amount, 2), "danger_hour": hour_of_trouble, "scheduled_at_abs": sched_at.isoformat()}
+        # return {"status": "WATER", "start_in_minutes": lead_h * 60, "amount_pct": round(amount, 2), "danger_hour": hour_of_trouble, "scheduled_at_abs": sched_at.isoformat()}
+        return {"amount_pct": round(amount, 2), "scheduled_at_abs": sched_at.isoformat()}
     
-    return {"status": "IDLE", "start_in_minutes": 0, "amount_pct": 0, "danger_hour": -1}
+    # return {"status": "IDLE", "start_in_minutes": 0, "amount_pct": 0, "danger_hour": -1}
+    return {"amount_pct": 0, "scheduled_at_abs": None}
 
 if __name__ == "__main__":
     import uvicorn
